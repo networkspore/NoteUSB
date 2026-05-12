@@ -1,0 +1,14 @@
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/note_usb.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/edit_cache.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/rebuild_cache.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/list_install_components.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/install.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/install/local.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/CMakeFiles/install/strip.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/note_usb_monitor.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/edit_cache.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/rebuild_cache.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/list_install_components.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/install.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/install/local.dir
+/home/iospore/Dev/Netnotes/NoteUSB/build/monitor/CMakeFiles/install/strip.dir

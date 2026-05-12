@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/note_usb_monitor.dir/note_usb_monitor.cpp.o CMakeFiles/note_usb_monitor.dir/home/iospore/Dev/Netnotes/NoteDaemon/src/device_registry.cpp.o -o note_usb_monitor  -lusb-1.0 

@@ -1,0 +1,16 @@
+{
+  "name": "note_usb",
+  "version": "1.0.0",
+  "description": "USB/HID device support for NoteDaemon",
+  "api_version": "1.0",
+  "dependencies": [],
+  "device_monitor": {
+    "enabled": true,
+    "binary": "monitor-note_usb"
+  },
+  "settings": {
+    "discovery_interval_ms": 1000,
+    "auto_detach_kernel": true,
+    "usb_timeout_ms": 100
+  }
+}
