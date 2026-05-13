@@ -307,26 +307,26 @@ private:
         // Register handlers for message types
 
         // Discovery request
-        registry.register_module_handler(name(), "request_discovery", [this](const NoteBytes::Object& msg) {
+        registry.register_handler(NoteMessaging::ProtocolMessages::REQUEST_DISCOVERY, [this](const NoteBytes::Object& msg) {
             (void)msg;  // Suppress unused warning
             syslog(LOG_DEBUG, "NoteUSB: handle request_discovery");
             send_device_list();
         });
 
         // Claim item
-        registry.register_module_handler(name(), "claim_item", [this](const NoteBytes::Object& msg) {
+        registry.register_handler(NoteMessaging::ProtocolMessages::CLAIM_ITEM, [this](const NoteBytes::Object& msg) {
             syslog(LOG_DEBUG, "NoteUSB: handle claim_item");
             handle_claim_device(msg);
         });
 
         // Release item
-        registry.register_module_handler(name(), "release_item", [this](const NoteBytes::Object& msg) {
+        registry.register_handler(NoteMessaging::ProtocolMessages::RELEASE_ITEM, [this](const NoteBytes::Object& msg) {
             syslog(LOG_DEBUG, "NoteUSB: handle release_item");
             handle_release_device(msg);
         });
 
         // Resume
-        registry.register_module_handler(name(), "resume", [this](const NoteBytes::Object& msg) {
+        registry.register_handler(NoteMessaging::ProtocolMessages::RESUME, [this](const NoteBytes::Object& msg) {
             syslog(LOG_DEBUG, "NoteUSB: handle resume");
             handle_resume(msg);
         });
