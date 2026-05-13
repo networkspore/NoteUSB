@@ -1,5 +1,7 @@
 // src/module.cpp
 // NoteUSB module implementation - implements IModule interface
+// Two-socket architecture: management socket handles claim/release/discovery
+// Device socket handles HID event streaming
 
 #include <string_view>
 #include <vector>
@@ -17,6 +19,7 @@
 // Include NoteDaemon module framework headers
 #include "module_framework/imodule.h"
 #include "module_framework/handler_registry.h"
+#include "module_framework/device_ownership_registry.h"
 #include "module_framework/error.h"
 
 #include "note_usb/device_handler.h"
@@ -46,7 +49,9 @@ public:
     NoteUSBModule()
         : handler_registry_(std::make_unique<NoteDaemon::HandlerRegistry>())
         , running_(false)
-        , monitor_pid_(-1) {
+        , monitor_pid_(-1)
+        , ownership_registry_(nullptr)
+    {
     }
 
     ~NoteUSBModule() override {
@@ -95,14 +100,27 @@ public:
 
         syslog(LOG_INFO, "[NoteUSB] init() - libusb initialized successfully");
 
-        // Initialize device handler
-        syslog(LOG_INFO, "[NoteUSB] init() - creating device handler");
-        device_handler_ = std::make_unique<DeviceHandler>();
+        // Initialize device handler - NOTE: ownership_registry_ will be set
+        // via set_ownership_registry() after init() returns
+        syslog(LOG_INFO, "[NoteUSB] init() - creating device handler (without ownership registry initially)");
+        device_handler_ = std::make_unique<DeviceHandler>(nullptr, "note_usb");
         syslog(LOG_INFO, "[NoteUSB] init() - device handler created");
 
         syslog(LOG_INFO, "[NoteUSB] init() completed");
 
         return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
+    }
+
+    void set_ownership_registry(NoteDaemon::DeviceOwnershipRegistry* registry) override {
+        syslog(LOG_INFO, "[NoteUSB] set_ownership_registry() called: %p", (void*)registry);
+        ownership_registry_ = registry;
+        
+        // Re-create DeviceHandler with ownership registry
+        // This is called after init() returns successfully
+        if (device_handler_) {
+            device_handler_ = std::make_unique<DeviceHandler>(ownership_registry_, "note_usb");
+            syslog(LOG_INFO, "[NoteUSB] DeviceHandler re-created with ownership registry");
+        }
     }
 
     NoteDaemon::Error start() override {
@@ -123,7 +141,6 @@ public:
         // NOTE: Disabled unconditional module-level hotplug callbacks
         // Hotplug should only fire for claimed devices, not all USB devices
         // Per-session hotplug is handled in NoteUSBSession when a device is claimed
-        // register_hotplug_callbacks();
 
         // Start device monitor if enabled
         if (config_.value("device_monitor", nlohmann::json::object())
@@ -132,7 +149,7 @@ public:
             start_device_monitor();
         }
 
-        // Register our handlers
+        // Register our handlers (for internal dispatch, not used for two-socket)
         syslog(LOG_INFO, "[NoteUSB] start() - registering handlers");
         register_handlers(*handler_registry_);
         syslog(LOG_INFO, "[NoteUSB] start() - handlers registered");
@@ -206,6 +223,116 @@ public:
         
         syslog(LOG_INFO, "NoteUSB: module shutdown complete (reason: %s)", reason.c_str());
     }
+
+    // ── Two-socket: Management message handler ────────────────────────────────
+
+    NoteDaemon::Error handle_management_message(const NoteBytes::Object& message,
+                                                int reply_fd,
+                                                pid_t client_pid) override {
+        // Determine command type
+        auto* cmd_val = message.get(NoteMessaging::Keys::CMD);
+        if (!cmd_val) {
+            // Try EVENT field
+            cmd_val = message.get(NoteMessaging::Keys::EVENT);
+        }
+        
+        if (!cmd_val) {
+            syslog(LOG_WARNING, "[NoteUSB] handle_management_message: no CMD or EVENT field");
+            return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::INVALID_MESSAGE,
+                                               "Missing CMD or EVENT field");
+        }
+
+        // Get command as string for logging (but compare NoteBytes::Value directly)
+        std::string cmd = cmd_val->as_string();
+        syslog(LOG_DEBUG, "[NoteUSB] handle_management_message: cmd=%s pid=%d", cmd.c_str(), client_pid);
+
+        // NOTE: We use the actual client_pid from SO_PEERCRED, not anything
+        // from the message. This prevents clients from impersonating other PIDs.
+
+        // Compare NoteBytes::Value directly instead of converting to string
+        if (*cmd_val == NoteMessaging::ProtocolMessages::REQUEST_DISCOVERY) {
+            // Handle discovery request
+            if (device_handler_) {
+                device_handler_->send_device_list(reply_fd);
+            }
+            return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
+        }
+
+        if (*cmd_val == NoteMessaging::ProtocolMessages::CLAIM_ITEM) {
+            // Handle claim request - use ACTUAL client_pid from socket credentials
+            if (!device_handler_) {
+                return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::NOT_INITIALIZED,
+                                                    "Device handler not initialized");
+            }
+            return device_handler_->claim_device(message, reply_fd, client_pid);
+        }
+
+        if (*cmd_val == NoteMessaging::ProtocolMessages::RELEASE_ITEM) {
+            // Handle release request
+            if (!device_handler_) {
+                return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::NOT_INITIALIZED,
+                                                    "Device handler not initialized");
+            }
+            return device_handler_->release_device(message, reply_fd);
+        }
+
+        syslog(LOG_WARNING, "[NoteUSB] handle_management_message: unknown command: %s", cmd.c_str());
+        return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::UNKNOWN,
+                                            "Unknown command: " + cmd);
+    }
+
+    // ── Two-socket: Device socket handler (post-DEVICE_HANDSHAKE) ─────────────
+
+    NoteDaemon::Error handle_client(int client_fd, pid_t client_pid) override {
+        syslog(LOG_INFO, "NoteUSB: handle_client (device socket) called (pid=%d, fd=%d)", 
+               client_pid, client_fd);
+
+        // Check if session already exists
+        if (sessions_.count(client_pid) > 0) {
+            std::string msg = "Session already exists for pid=" + std::to_string(client_pid);
+            return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::ALREADY_INITIALIZED,
+                                                msg);
+        }
+
+        // Create session - this session reads HID events from the device socket
+        auto session = std::make_unique<NoteUSBSession>(usb_ctx_, client_fd, client_pid);
+        
+        // Start session reading in a separate thread
+        NoteUSBSession* session_ptr = session.get();
+        std::thread session_thread([session_ptr, client_pid]() {
+            syslog(LOG_INFO, "NoteUSB: starting device socket session thread for pid=%d", client_pid);
+            session_ptr->start();
+            syslog(LOG_INFO, "NoteUSB: device socket session thread ended for pid=%d", client_pid);
+        });
+        
+        // Detach the thread - session will clean itself up when socket closes
+        session_thread.detach();
+
+        // Store session
+        sessions_[client_pid] = std::move(session);
+
+        syslog(LOG_INFO, "NoteUSB: device socket session created (pid=%d, total=%zu)",
+               client_pid, sessions_.size());
+
+        // Note: We don't send ACCEPT here - the device socket is for streaming events
+        // The management socket handles the initial handshake and claim response
+
+        return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
+    }
+
+    void cleanup_client(pid_t client_pid) override {
+        syslog(LOG_INFO, "NoteUSB: cleanup_client (device socket) called (pid=%d)", client_pid);
+
+        auto it = sessions_.find(client_pid);
+        if (it != sessions_.end()) {
+            it->second->stop();
+            sessions_.erase(it);
+            syslog(LOG_INFO, "NoteUSB: device socket session cleaned up (pid=%d, total=%zu)",
+                   client_pid, sessions_.size());
+        }
+    }
+
+    // ===== Remaining IModule methods =====
 
     NoteDaemon::Error check_health(const std::string& core_api_version) override {
         // Check if we're compatible with the core API version
@@ -286,48 +413,34 @@ public:
         }
     }
 
-    NoteDaemon::Error claim_device(const NoteBytes::Object& msg) {
-        if (device_handler_) {
-            return device_handler_->claim_device(msg);
-        }
-        return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::NOT_INITIALIZED,
-                                            "Device handler not initialized");
-    }
-
-    NoteDaemon::Error release_device(const NoteBytes::Object& msg) {
-        if (device_handler_) {
-            return device_handler_->release_device(msg);
-        }
-        return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::NOT_INITIALIZED,
-                                            "Device handler not initialized");
-    }
-
 private:
     void register_handlers(NoteDaemon::HandlerRegistry& registry) {
-        // Register handlers for message types
+        // Register handlers for message types (kept for internal use, not socket routing)
 
         // Discovery request
         registry.register_handler(NoteMessaging::ProtocolMessages::REQUEST_DISCOVERY, [this](const NoteBytes::Object& msg) {
-            (void)msg;  // Suppress unused warning
-            syslog(LOG_DEBUG, "NoteUSB: handle request_discovery");
-            send_device_list();
+            (void)msg;
+            syslog(LOG_DEBUG, "NoteUSB: internal handler request_discovery");
+            if (device_handler_) {
+                device_handler_->send_device_list(-1);  // broadcast
+            }
         });
 
         // Claim item
         registry.register_handler(NoteMessaging::ProtocolMessages::CLAIM_ITEM, [this](const NoteBytes::Object& msg) {
-            syslog(LOG_DEBUG, "NoteUSB: handle claim_item");
-            handle_claim_device(msg);
+            syslog(LOG_DEBUG, "NoteUSB: internal handler claim_item");
+            // This path is no longer used - handle_management_message handles it
         });
 
         // Release item
         registry.register_handler(NoteMessaging::ProtocolMessages::RELEASE_ITEM, [this](const NoteBytes::Object& msg) {
-            syslog(LOG_DEBUG, "NoteUSB: handle release_item");
-            handle_release_device(msg);
+            syslog(LOG_DEBUG, "NoteUSB: internal handler release_item");
+            // This path is no longer used - handle_management_message handles it
         });
 
         // Resume
         registry.register_handler(NoteMessaging::ProtocolMessages::RESUME, [this](const NoteBytes::Object& msg) {
-            syslog(LOG_DEBUG, "NoteUSB: handle resume");
+            syslog(LOG_DEBUG, "NoteUSB: internal handler resume");
             handle_resume(msg);
         });
 
@@ -358,94 +471,7 @@ private:
         syslog(LOG_INFO, "NoteUSB: device monitor started (PID %d)", pid);
     }
 
-private:
-    // ===== DEVICE HANDLERS =====
-
-    void send_device_list() {
-        // Ensure devices are discovered first
-        if (device_handler_) {
-            device_handler_->discover_devices();
-        }
-
-        NoteBytes::Object response;
-        response.add(NoteMessaging::Keys::EVENT, NoteMessaging::ProtocolMessages::ITEM_LIST);
-
-        NoteBytes::Array devices_array;
-        if (device_handler_) {
-            const auto& devices = device_handler_->available_devices();
-            for (const auto& [id, device] : devices) {
-                auto device_obj = device->to_notebytes();
-                auto device_bytes = device_obj.serialize();
-                devices_array.add(NoteBytes::Value(device_bytes, NoteBytes::Type::OBJECT));
-            }
-        }
-        response.add(NoteMessaging::Keys::ITEMS, devices_array.as_value());
-
-        send_response(response);
-        syslog(LOG_INFO, "NoteUSB: sent device list");
-    }
-
-    void handle_claim_device(const NoteBytes::Object& msg) {
-        // Delegate to DeviceHandler
-        NoteDaemon::Error result = NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::UNKNOWN, "Device handler not initialized");
-
-        if (device_handler_) {
-            result = device_handler_->claim_device(msg);
-        }
-
-        if (result.success()) {
-            // Get device_id from message
-            auto* device_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
-            std::string device_id = device_id_val ? device_id_val->as_string() : "";
-
-            // Send success response
-            NoteBytes::Object response;
-            response.add(NoteMessaging::Keys::EVENT, NoteMessaging::ProtocolMessages::ITEM_CLAIMED);
-            response.add(NoteMessaging::Keys::DEVICE_ID, device_id);
-            response.add(NoteMessaging::Keys::STATUS, "claimed");
-
-            send_response(response);
-            syslog(LOG_INFO, "NoteUSB: device claimed: %s", device_id.c_str());
-        } else {
-            // Send error response
-            auto* device_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
-            std::string device_id = device_id_val ? device_id_val->as_string() : "";
-
-            send_error(NoteMessaging::ProtocolMessages::ITEM_CLAIMED, device_id,
-                      result.code, std::string(result.message()));
-        }
-    }
-
-    void handle_release_device(const NoteBytes::Object& msg) {
-        // Delegate to DeviceHandler
-        NoteDaemon::Error result = NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::UNKNOWN, "Device handler not initialized");
-
-        if (device_handler_) {
-            result = device_handler_->release_device(msg);
-        }
-
-        if (result.success()) {
-            // Get device_id from message
-            auto* device_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
-            std::string device_id = device_id_val ? device_id_val->as_string() : "";
-
-            // Send success response
-            NoteBytes::Object response;
-            response.add(NoteMessaging::Keys::EVENT, NoteMessaging::ProtocolMessages::ITEM_RELEASED);
-            response.add(NoteMessaging::Keys::DEVICE_ID, device_id);
-            response.add(NoteMessaging::Keys::STATUS, NoteMessaging::ProtocolMessages::SUCCESS);
-
-            send_response(response);
-            syslog(LOG_INFO, "NoteUSB: device released: %s", device_id.c_str());
-        } else {
-            // Send error response
-            auto* device_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
-            std::string device_id = device_id_val ? device_id_val->as_string() : "";
-
-            send_error(NoteMessaging::ProtocolMessages::ITEM_RELEASED, device_id,
-                      result.code, std::string(result.message()));
-        }
-    }
+    // ===== Legacy/internal handlers (not used for two-socket) =====
 
     void handle_resume(const NoteBytes::Object& msg) {
         int processed_count = msg.get_int(std::string_view("processed_count"), 0);
@@ -459,125 +485,11 @@ private:
         syslog(LOG_DEBUG, "NoteUSB: resume acknowledged %d messages for device %s",
                processed_count, device_id.c_str());
 
-        if (processed_count <= 0) return;
-
         // TODO: Implement resume logic
-        syslog(LOG_DEBUG, "NoteUSB: resume for device %s", device_id.c_str());
-    }
-
-    void send_response(const NoteBytes::Object& response) {
-        // Get client_fd from somewhere - this is a placeholder
-        // In a real implementation, we'd track active sessions
-        syslog(LOG_DEBUG, "NoteUSB: send_response - not yet implemented");
-    }
-
-    void send_error(const NoteBytes::Value& event, const std::string& device_id,
-                    int code, const std::string& message) {
-        NoteBytes::Object msg;
-        msg.add(NoteMessaging::Keys::EVENT, event);
-        msg.add(NoteMessaging::Keys::ERROR, code);
-        msg.add(NoteMessaging::Keys::MSG, message);
-        msg.add(NoteMessaging::Keys::DEVICE_ID, device_id);
-
-        send_response(msg);
-    }
-
-    void send_error(int code, const std::string& message) {
-        NoteBytes::Object msg;
-        msg.add(NoteMessaging::Keys::EVENT, NoteMessaging::ProtocolMessages::ERROR);
-        msg.add(NoteMessaging::Keys::ERROR, code);
-        msg.add(NoteMessaging::Keys::MSG, message);
-
-        send_response(msg);
-    }
-
-    // ===== SESSION MANAGEMENT =====
-
-    NoteDaemon::Error handle_client(int client_fd, pid_t client_pid) override {
-        syslog(LOG_INFO, "NoteUSB: handle_client called (pid=%d, fd=%d)", client_pid, client_fd);
-
-        // Check if session already exists
-        if (sessions_.count(client_pid) > 0) {
-            std::string msg = "Session already exists for pid=" + std::to_string(client_pid);
-            return NoteDaemon::Error::from_code(NoteDaemon::ErrorCodes::ALREADY_INITIALIZED,
-                                                msg);
-        }
-
-        // Create session (discovery only - no device yet)
-        auto session = std::make_unique<NoteUSBSession>(usb_ctx_, client_fd, client_pid);
-        
-        // IMPORTANT: Start session reading in a separate thread
-        // The session->start() method runs read_socket() in a blocking loop
-        // If we call it in this thread, the code after it (sending ACCEPT) 
-        // would never execute!
-        // Note: We capture session.get() (raw pointer) before moving the unique_ptr
-        NoteUSBSession* session_ptr = session.get();
-        std::thread session_thread([session_ptr, client_pid]() {
-            syslog(LOG_INFO, "NoteUSB: starting session thread for pid=%d", client_pid);
-            session_ptr->start();
-            syslog(LOG_INFO, "NoteUSB: session thread ended for pid=%d", client_pid);
-        });
-        
-        // Detach the thread - session will clean itself up when socket closes
-        session_thread.detach();
-
-        // Store session (transfer ownership using move)
-        sessions_[client_pid] = std::move(session);
-
-        syslog(LOG_INFO, "NoteUSB: session created and started (pid=%d, total=%zu)",
-               client_pid, sessions_.size());
-
-        // Send ACCEPT response for handshake
-        // This is now sent AFTER the session reading has started in background
-        try {
-            NoteBytes::Object accept_response;
-            accept_response.add(NoteMessaging::Keys::EVENT, NoteMessaging::ProtocolMessages::ACCEPT);
-            accept_response.add(NoteMessaging::Keys::STATUS, "accepted");
-            
-            NoteBytes::Writer writer(client_fd, false);
-            writer.write(accept_response);
-            writer.flush();
-            
-            syslog(LOG_INFO, "NoteUSB: sent ACCEPT to pid=%d", client_pid);
-        } catch (const std::exception& e) {
-            syslog(LOG_ERR, "NoteUSB: failed to send ACCEPT to pid=%d: %s", 
-                   client_pid, e.what());
-            // Don't fail the connection - session will handle this
-        }
-
-        return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
-    }
-
-    void cleanup_client(pid_t client_pid) override {
-        syslog(LOG_INFO, "NoteUSB: cleanup_client called (pid=%d)", client_pid);
-
-        auto it = sessions_.find(client_pid);
-        if (it != sessions_.end()) {
-            it->second->stop();
-            sessions_.erase(it);
-            syslog(LOG_INFO, "NoteUSB: session cleaned up (pid=%d, total=%zu)",
-                   client_pid, sessions_.size());
-        }
-    }
-
-    void register_session(pid_t client_pid, int client_fd) {
-        SessionManager::instance().register_session(client_fd, client_pid, nullptr);
-        syslog(LOG_INFO, "NoteUSB: session registered (pid=%d, fd=%d, total=%zu)",
-               client_pid, client_fd, SessionManager::instance().session_count());
-    }
-
-    void unregister_session(pid_t client_pid) {
-        SessionManager::instance().unregister_session(client_pid);
-        syslog(LOG_INFO, "NoteUSB: session unregistered (pid=%d, total=%zu)",
-               client_pid, SessionManager::instance().session_count());
-    }
-
-    void broadcast_to_all_sessions(const NoteBytes::Object& msg) {
-        SessionManager::instance().broadcast_to_all_sessions(msg);
     }
 
     // ===== HOTPLUG SUPPORT =====
-    
+
     void register_hotplug_callbacks() {
         if (!libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
             syslog(LOG_WARNING, "NoteUSB: libusb hotplug not supported on this platform");
@@ -590,7 +502,7 @@ private:
         int rc = libusb_hotplug_register_callback(
             usb_ctx_,
             LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED,
-            LIBUSB_HOTPLUG_ENUMERATE,  // Also fire for existing devices
+            LIBUSB_HOTPLUG_ENUMERATE,
             LIBUSB_HOTPLUG_MATCH_ANY,
             LIBUSB_HOTPLUG_MATCH_ANY,
             LIBUSB_HOTPLUG_MATCH_ANY,
@@ -622,8 +534,6 @@ private:
         if (rc != LIBUSB_SUCCESS) {
             syslog(LOG_ERR, "NoteUSB: failed to register hotplug callback (detached): %s",
                    libusb_error_name(rc));
-        } else {
-            syslog(LOG_INFO, "NoteUSB: registered hotplug callback for USB device departures");
         }
     }
 
@@ -633,9 +543,7 @@ private:
         libusb_hotplug_event event,
         void* user_data)
     {
-        (void)ctx;         // unused
-        (void)event;       // unused
-        (void)user_data;  // unused
+        (void)ctx; (void)event; (void)user_data;
 
         auto* self = static_cast<NoteUSBModule*>(user_data);
 
@@ -646,17 +554,16 @@ private:
 
             syslog(LOG_INFO, "NoteUSB: USB device attached: %s", device_id.c_str());
 
-            // Build descriptor for this device
             auto device_desc = self->build_device_descriptor(device, device_id);
             if (!device_desc) {
-                return 0;  // Not a HID device, ignore
+                return 0;
             }
 
-            // Send DEVICE_ATTACHED to all sessions
+            // Broadcast to management sockets
             self->send_device_attached(device_id, device_desc);
         }
 
-        return 0;  // Continue receiving events
+        return 0;
     }
 
     static int LIBUSB_CALL hotplug_callback_detached(
@@ -665,9 +572,7 @@ private:
         libusb_hotplug_event event,
         void* user_data)
     {
-        (void)ctx;         // unused
-        (void)event;       // unused
-        (void)user_data;  // unused
+        (void)ctx; (void)event; (void)user_data;
 
         auto* self = static_cast<NoteUSBModule*>(user_data);
 
@@ -678,11 +583,10 @@ private:
 
             syslog(LOG_INFO, "NoteUSB: USB device detached: %s", device_id.c_str());
 
-            // Send DEVICE_DETACHED to all sessions
             self->send_device_detached(device_id);
         }
 
-        return 0;  // Continue receiving events
+        return 0;
     }
 
     std::shared_ptr<USBDeviceDescriptor> build_device_descriptor(
@@ -691,8 +595,6 @@ private:
         struct libusb_device_descriptor desc;
         int result = libusb_get_device_descriptor(device, &desc);
         if (result != LIBUSB_SUCCESS) {
-            syslog(LOG_WARNING, "NoteUSB: failed to get device descriptor for %s: %s",
-                   device_id.c_str(), libusb_error_name(result));
             return nullptr;
         }
 
@@ -715,14 +617,11 @@ private:
                         NoteMessaging::ProtocolMessages::DEVICE_ATTACHED);
         notification.add(NoteMessaging::Keys::DEVICE_ID, device_id);
 
-        // Include full device descriptor (same format as ITEM_LIST entries)
         auto device_obj = device_desc->to_notebytes();
         notification.add(NoteMessaging::ProtocolMessages::ITEM_INFO, device_obj.as_value());
 
-        broadcast_to_all_sessions(notification);
-
-        syslog(LOG_INFO, "NoteUSB: sent DEVICE_ATTACHED for %s to all sessions",
-               device_id.c_str());
+        // Broadcast to management sockets via SessionManager
+        SessionManager::instance().broadcast_to_all(notification);
     }
 
     void send_device_detached(const std::string& device_id) {
@@ -731,10 +630,8 @@ private:
                         NoteMessaging::ProtocolMessages::DEVICE_DETACHED);
         notification.add(NoteMessaging::Keys::DEVICE_ID, device_id);
 
-        broadcast_to_all_sessions(notification);
-
-        syslog(LOG_INFO, "NoteUSB: sent DEVICE_DETACHED for %s to all sessions",
-               device_id.c_str());
+        // Broadcast to management sockets via SessionManager
+        SessionManager::instance().broadcast_to_all(notification);
     }
 
     // Configuration
@@ -747,20 +644,19 @@ private:
     bool running_;
     pid_t monitor_pid_;
 
+    // Core-provided registry for device ownership
+    NoteDaemon::DeviceOwnershipRegistry* ownership_registry_;
+
     // Components
     std::unique_ptr<NoteDaemon::HandlerRegistry> handler_registry_;
     std::unique_ptr<DeviceHandler> device_handler_;
     libusb_context* usb_ctx_ = nullptr;
 
-    // Active sessions (pid -> NoteUSBSession)
+    // Active device socket sessions (pid -> NoteUSBSession)
     std::map<pid_t, std::unique_ptr<NoteUSBSession>> sessions_;
-
-    // Note: Device state is managed by DeviceHandler, not here
-    // This avoids duplication between module and handler
 };
 
 // Module factory function - exported for dynamic loading
-// Must come AFTER the full class definition to avoid incomplete type error
 extern "C" NoteDaemon::IModule* create_module() {
     static NoteUSBModule instance;
     return &instance;

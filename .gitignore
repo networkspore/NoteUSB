@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+
+# Editor/IDE
+.vscode/
+
+# Compiler caches
+.cache/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

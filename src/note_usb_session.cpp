@@ -434,7 +434,7 @@ void NoteUSBSession::register_for_hotplug() {
 
 void NoteUSBSession::unregister_from_hotplug() {
     // Unregister from global session manager
-    SessionManager::instance().unregister_session_by_client(client_fd_, client_pid_);
+    SessionManager::instance().unregister_session(client_pid_);
     syslog(LOG_INFO, "NoteUSBSession: unregistered from hotplug notifications");
 }
 

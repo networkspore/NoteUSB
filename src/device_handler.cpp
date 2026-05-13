@@ -1,291 +1,229 @@
 // src/device_handler.cpp
-// Device handler implementation for NoteUSB module
+// DeviceHandler implementation for NoteUSB.
+//
+// Two-socket changes vs. old version:
+//   • claim_device() / release_device() accept reply_fd and write responses directly.
+//   • claim_device() calls ownership_registry_->register_device() on success.
+//   • release_device() calls ownership_registry_->unregister_device() on success.
+//   • send_device_list() writes ITEM_LIST to reply_fd (or broadcasts if -1).
+//   • All response formatting is done here; the module layer is no longer
+//     responsible for building ITEM_CLAIMED / ITEM_RELEASED objects.
 
 #include "note_usb/device_handler.h"
 #include "note_usb/session_manager.h"
+
 #include <syslog.h>
 #include <cstdio>
 #include <sstream>
 #include <sys/stat.h>
 #include <fstream>
+#include <unistd.h>
 
-// Include NoteDaemon headers for NoteBytes and messaging
 #include "note_messaging.h"
 #include "notebytes.h"
+#include "notebytes_writer.h"
 #include "event_bytes.h"
 #include "capability_registry.h"
 
 namespace NoteUSB {
 
 // =============================================================================
-// USBDeviceDescriptor implementation
+// USBDeviceDescriptor
 // =============================================================================
 
 NoteBytes::Object USBDeviceDescriptor::to_notebytes() const {
     NoteBytes::Object obj;
-    obj.add(NoteBytes::Value("device_id"), NoteBytes::Value(device_id));
-    obj.add(NoteBytes::Value("vendor_id"), NoteBytes::Value((int)vendor_id));
-    obj.add(NoteBytes::Value("product_id"), NoteBytes::Value((int)product_id));
-    obj.add(NoteBytes::Value("interface_number"), NoteBytes::Value(interface_number));
+    obj.add(NoteBytes::Value("device_id"),          NoteBytes::Value(device_id));
+    obj.add(NoteBytes::Value("vendor_id"),          NoteBytes::Value((int)vendor_id));
+    obj.add(NoteBytes::Value("product_id"),         NoteBytes::Value((int)product_id));
+    obj.add(NoteBytes::Value("interface_number"),   NoteBytes::Value(interface_number));
+    obj.add(NoteBytes::Value("kernel_driver_attached"),
+            NoteBytes::Value(kernel_driver_attached));
     return obj;
 }
 
 // =============================================================================
-// DeviceRegistry implementation (module-private)
+// DeviceRegistry
 // =============================================================================
 
 const std::string& DeviceRegistry::path() {
-    static std::string path = "/run/netnotes/modules/note_usb/device_registry.json";
-    return path;
+    static std::string p = "/run/netnotes/modules/note_usb/device_registry.json";
+    return p;
 }
 
-void DeviceRegistry::add_device(const std::string& device_id, int interface_number, bool kernel_driver_attached) {
-    std::lock_guard<std::mutex> lock(registry_mutex());
+std::string& DeviceRegistry::registry_path() {
+    static std::string p = "/run/netnotes/modules/note_usb/device_registry.json";
+    return p;
+}
 
-    ClaimedDevice device;
-    device.pid = getpid();  // Daemon's PID
-    device.device_id = device_id;
-    device.interface_number = interface_number;
-    device.kernel_driver_attached = kernel_driver_attached;
+std::mutex& DeviceRegistry::registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+void DeviceRegistry::add_device(const std::string& device_id,
+                                int interface_number,
+                                bool kernel_driver_attached) {
+    std::lock_guard lock(registry_mutex());
+
+    ClaimedDevice d;
+    d.pid                    = getpid();
+    d.device_id              = device_id;
+    d.interface_number       = interface_number;
+    d.kernel_driver_attached = kernel_driver_attached;
 
     auto devices = read_registry();
-
-    // Remove any existing entry for this device (idempotent)
-    devices.erase(
-        std::remove_if(devices.begin(), devices.end(),
-            [&device](const ClaimedDevice& d) {
-                return d.device_id == device.device_id;
-            }),
+    devices.erase(std::remove_if(devices.begin(), devices.end(),
+        [&](const ClaimedDevice& x){ return x.device_id == device_id; }),
         devices.end());
-
-    devices.push_back(device);
+    devices.push_back(d);
     write_registry(devices);
 
-    syslog(LOG_INFO, "DeviceRegistry: added device %s (interface %d)", device_id.c_str(), interface_number);
+    syslog(LOG_INFO, "[DeviceRegistry] added %s (iface=%d)",
+           device_id.c_str(), interface_number);
 }
 
 bool DeviceRegistry::remove_device(const std::string& device_id) {
-    std::lock_guard<std::mutex> lock(registry_mutex());
+    std::lock_guard lock(registry_mutex());
 
     auto devices = read_registry();
     auto it = std::remove_if(devices.begin(), devices.end(),
-        [&device_id](const ClaimedDevice& d) {
-            return d.device_id == device_id;
-        });
+        [&](const ClaimedDevice& x){ return x.device_id == device_id; });
 
     if (it == devices.end()) {
-        syslog(LOG_WARNING, "DeviceRegistry: device %s not found in registry", device_id.c_str());
+        syslog(LOG_WARNING, "[DeviceRegistry] %s not found", device_id.c_str());
         return false;
     }
-
     devices.erase(it, devices.end());
     write_registry(devices);
-
-    syslog(LOG_INFO, "DeviceRegistry: removed device %s", device_id.c_str());
+    syslog(LOG_INFO, "[DeviceRegistry] removed %s", device_id.c_str());
     return true;
 }
 
 std::vector<ClaimedDevice> DeviceRegistry::get_all_devices() {
-    std::lock_guard<std::mutex> lock(registry_mutex());
+    std::lock_guard lock(registry_mutex());
     return read_registry();
 }
 
 void DeviceRegistry::remove_all() {
-    std::lock_guard<std::mutex> lock(registry_mutex());
-
-    auto devices = read_registry();
-    devices.clear();
-    write_registry(devices);
-
-    syslog(LOG_INFO, "DeviceRegistry: removed all devices");
+    std::lock_guard lock(registry_mutex());
+    write_registry({});
+    syslog(LOG_INFO, "[DeviceRegistry] cleared");
 }
 
-// =============================================================================
+// ── JSON serialisation (no external deps) ────────────────────────────────────
 
-std::mutex& DeviceRegistry::registry_mutex() {
-    static std::mutex mtx;
-    return mtx;
+std::string DeviceRegistry::json_object(const ClaimedDevice& d) {
+    std::ostringstream oss;
+    oss << "{"
+        << "\"pid\":"                    << d.pid                    << ","
+        << "\"device_id\":\""            << d.device_id              << "\","
+        << "\"interface_number\":"       << d.interface_number       << ","
+        << "\"kernel_driver_attached\":" << (d.kernel_driver_attached ? "true" : "false")
+        << "}";
+    return oss.str();
 }
 
-std::string& DeviceRegistry::registry_path() {
-    static std::string path = "/run/netnotes/modules/note_usb/device_registry.json";
-    return path;
+bool DeviceRegistry::write_registry(const std::vector<ClaimedDevice>& devices) {
+    // Ensure directory exists
+    std::string dir = registry_path();
+    if (auto slash = dir.find_last_of('/'); slash != std::string::npos) {
+        mkdir(dir.substr(0, slash).c_str(), 0755);
+    }
+
+    std::ofstream f(registry_path());
+    if (!f) {
+        syslog(LOG_WARNING, "[DeviceRegistry] cannot write %s",
+               registry_path().c_str());
+        return false;
+    }
+    f << "[";
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (i) f << ",";
+        f << json_object(devices[i]);
+    }
+    f << "]\n";
+    return true;
 }
 
 std::vector<ClaimedDevice> DeviceRegistry::read_registry() {
     std::vector<ClaimedDevice> devices;
 
-    struct stat st;
-    if (stat(registry_path().c_str(), &st) != 0) {
-        // File doesn't exist yet — nothing to read
-        return devices;
-    }
+    std::ifstream f(registry_path());
+    if (!f) return devices;   // file doesn't exist yet
 
-    std::ifstream file(registry_path());
-    if (!file.is_open()) {
-        syslog(LOG_WARNING, "DeviceRegistry: failed to open registry: %s",
-               registry_path().c_str());
-        return devices;
-    }
-
-    // Read entire file
-    std::string content((std::istreambuf_iterator<char>(file)),
+    std::string content((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
 
-    // Simple JSON array parser — no external dependencies
-    // Format: [{"pid":12345,"device_id":"1:3","interface_number":0,"kernel_driver_attached":true},...]
-
-    // Find all object boundaries
+    // Simple brace-matched JSON array parser
     size_t pos = 0;
     while (pos < content.size()) {
-        // Find the start of an object
         size_t obj_start = content.find('{', pos);
         if (obj_start == std::string::npos) break;
 
-        // Find the matching end
         int depth = 0;
         size_t obj_end = obj_start;
-        for (size_t i = obj_start; i < content.size(); i++) {
-            if (content[i] == '{') depth++;
+        for (size_t i = obj_start; i < content.size(); ++i) {
+            if (content[i] == '{') ++depth;
             if (content[i] == '}') {
-                depth--;
-                if (depth == 0) {
-                    obj_end = i;
-                    break;
-                }
+                if (--depth == 0) { obj_end = i; break; }
             }
         }
+        if (obj_end == obj_start) { ++pos; continue; }
 
-        if (obj_end == obj_start) {
-            pos = obj_start + 1;
-            continue;
-        }
-
-        // Parse this object
         std::string obj = content.substr(obj_start + 1, obj_end - obj_start - 1);
+        ClaimedDevice d;
 
-        ClaimedDevice device;
-        device.pid = 0;
-        device.interface_number = 0;
-        device.kernel_driver_attached = false;
+        // Parse known keys
+        auto extract_string = [&](const std::string& key) -> std::string {
+            std::string search = "\"" + key + "\":\"";
+            auto p = obj.find(search);
+            if (p == std::string::npos) return {};
+            p += search.size();
+            auto e = obj.find('"', p);
+            return (e == std::string::npos) ? std::string{} : obj.substr(p, e - p);
+        };
+        auto extract_int = [&](const std::string& key) -> long long {
+            std::string search = "\"" + key + "\":";
+            auto p = obj.find(search);
+            if (p == std::string::npos) return 0;
+            p += search.size();
+            try { return std::stoll(obj.substr(p)); } catch (...) { return 0; }
+        };
+        auto extract_bool = [&](const std::string& key) -> bool {
+            std::string search = "\"" + key + "\":";
+            auto p = obj.find(search);
+            if (p == std::string::npos) return false;
+            p += search.size();
+            while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t')) ++p;
+            return obj.substr(p, 4) == "true";
+        };
 
-        // Parse key-value pairs
-        size_t key_pos = 0;
-        while (key_pos < obj.size()) {
-            // Find key
-            size_t key_start = obj.find('"', key_pos);
-            if (key_start == std::string::npos) break;
+        d.pid                    = (pid_t)extract_int("pid");
+        d.device_id              = extract_string("device_id");
+        d.interface_number       = (int)extract_int("interface_number");
+        d.kernel_driver_attached = extract_bool("kernel_driver_attached");
 
-            size_t key_end = obj.find('"', key_start + 1);
-            if (key_end == std::string::npos) break;
-
-            std::string key = obj.substr(key_start + 1, key_end - key_start - 1);
-
-            // Skip to value
-            size_t val_start = obj.find(':', key_end + 1);
-            if (val_start == std::string::npos) break;
-
-            // Parse value based on key
-            if (key == "pid") {
-                size_t val_end = obj.find(',', val_start + 1);
-                if (val_end == std::string::npos) val_end = obj.find('}', val_start + 1);
-                std::string val = obj.substr(val_start + 1, val_end - val_start - 1);
-                try {
-                    device.pid = std::stoll(val);
-                } catch (...) {
-                    device.pid = 0;
-                }
-            } else if (key == "device_id") {
-                size_t val_start2 = obj.find('"', val_start + 1);
-                size_t val_end2 = obj.find('"', val_start2 + 1);
-                if (val_start2 != std::string::npos && val_end2 != std::string::npos) {
-                    device.device_id = obj.substr(val_start2 + 1, val_end2 - val_start2 - 1);
-                }
-            } else if (key == "interface_number") {
-                size_t val_end = obj.find(',', val_start + 1);
-                if (val_end == std::string::npos) val_end = obj.find('}', val_start + 1);
-                std::string val = obj.substr(val_start + 1, val_end - val_start - 1);
-                try {
-                    device.interface_number = std::stoi(val);
-                } catch (...) {
-                    device.interface_number = 0;
-                }
-            } else if (key == "kernel_driver_attached") {
-                std::string val = obj.substr(val_start + 1);
-                // Trim whitespace and closing brace
-                size_t end = val.find('}');
-                if (end != std::string::npos) val = val.substr(0, end);
-                size_t end2 = val.find(',');
-                if (end2 != std::string::npos) val = val.substr(0, end2);
-                // Trim
-                size_t start = val.find_first_not_of(" \t\r\n");
-                if (start != std::string::npos) {
-                    val = val.substr(start);
-                }
-                device.kernel_driver_attached = (val == "true");
-            }
-
-            // Move past this key-value pair
-            key_pos = (key_end + 1 < obj.size()) ? obj.find('"', key_end + 1) : std::string::npos;
-        }
-
-        // Only add if we got a valid device
-        if (!device.device_id.empty()) {
-            devices.push_back(device);
-        }
-
+        if (!d.device_id.empty()) devices.push_back(d);
         pos = obj_end + 1;
     }
 
     return devices;
 }
 
-bool DeviceRegistry::write_registry(const std::vector<ClaimedDevice>& devices) {
-    // Ensure directory exists
-    std::string dir = registry_path();
-    size_t last_slash = dir.find_last_of('/');
-    if (last_slash != std::string::npos) {
-        std::string dir_path = dir.substr(0, last_slash);
-        mkdir(dir_path.c_str(), 0755);
-    }
-
-    std::ofstream file(registry_path());
-    if (!file.is_open()) {
-        syslog(LOG_WARNING, "DeviceRegistry: failed to write registry: %s",
-               registry_path().c_str());
-        return false;
-    }
-
-    file << "[";
-    for (size_t i = 0; i < devices.size(); i++) {
-        if (i > 0) file << ", ";
-        file << json_object(devices[i]);
-    }
-    file << "]" << std::endl;
-
-    return true;
-}
-
-std::string DeviceRegistry::json_object(const ClaimedDevice& device) {
-    std::ostringstream oss;
-    oss << "{"
-        << "\"pid\":" << device.pid << ","
-        << "\"device_id\":\"" << device.device_id << "\","
-        << "\"interface_number\":" << device.interface_number << ","
-        << "\"kernel_driver_attached\":" << (device.kernel_driver_attached ? "true" : "false")
-        << "}";
-    return oss.str();
-}
-
 // =============================================================================
-// DeviceHandler implementation
+// DeviceHandler
 // =============================================================================
 
-DeviceHandler::DeviceHandler() {
-    // Initialize libusb
+DeviceHandler::DeviceHandler(NoteDaemon::DeviceOwnershipRegistry* ownership_registry,
+                             std::string_view module_name)
+    : ownership_registry_(ownership_registry)
+    , module_name_(module_name)
+{
     int rc = libusb_init(&ctx_);
     if (rc != 0) {
-        syslog(LOG_ERR, "NoteUSB: failed to init libusb: %s", libusb_error_name(rc));
+        syslog(LOG_ERR, "[DeviceHandler] libusb_init failed: %s",
+               libusb_error_name(rc));
     }
 }
 
@@ -297,331 +235,376 @@ DeviceHandler::~DeviceHandler() {
     }
 }
 
+// ── Discovery ─────────────────────────────────────────────────────────────────
+
 void DeviceHandler::start_discovery() {
-    syslog(LOG_INFO, "[DeviceHandler] start_discovery() called");
-    if (running_) {
-        syslog(LOG_WARNING, "[DeviceHandler] start_discovery() called but already running");
-        return;
-    }
-
+    if (running_) return;
     running_ = true;
-    syslog(LOG_INFO, "[DeviceHandler] start_discovery() - setting running=true");
-    syslog(LOG_INFO, "NoteUSB: device discovery started");
-
-    // Perform initial discovery
-    syslog(LOG_INFO, "[DeviceHandler] start_discovery() - calling discover_devices()");
+    syslog(LOG_INFO, "[DeviceHandler] discovery started");
     discover_devices();
-    syslog(LOG_INFO, "[DeviceHandler] start_discovery() - discover_devices() completed");
 }
 
 void DeviceHandler::stop_discovery() {
     running_ = false;
-    syslog(LOG_INFO, "NoteUSB: device discovery stopped");
+    syslog(LOG_INFO, "[DeviceHandler] discovery stopped");
 }
 
 void DeviceHandler::discover_devices() {
-    syslog(LOG_INFO, "[DeviceHandler] discover_devices() called");
-    if (!ctx_) {
-        syslog(LOG_ERR, "[DeviceHandler] discover_devices() - libusb not initialized");
-        return;
-    }
+    if (!ctx_) return;
 
-    syslog(LOG_INFO, "[DeviceHandler] discover_devices() - about to call libusb_get_device_list");
-    libusb_device** device_list = nullptr;
-    ssize_t count = libusb_get_device_list(ctx_, &device_list);
-    syslog(LOG_INFO, "[DeviceHandler] discover_devices() - libusb_get_device_list returned %zd", count);
-
+    libusb_device** list = nullptr;
+    ssize_t count = libusb_get_device_list(ctx_, &list);
     if (count < 0) {
-        syslog(LOG_ERR, "[DeviceHandler] discover_devices() - failed to get USB device list: %s",
+        syslog(LOG_ERR, "[DeviceHandler] libusb_get_device_list: %s",
                libusb_error_name((int)count));
         return;
     }
 
-    syslog(LOG_INFO, "NoteUSB: scanning %zd USB devices", count);
-
     for (ssize_t i = 0; i < count; ++i) {
-        libusb_device* device = device_list[i];
+        libusb_device* dev = list[i];
+        if (!is_hid_device(dev)) continue;
 
-        // Check if this is a HID device
-        if (!is_hid_device(device)) {
-            continue;
-        }
-
-        // Get device descriptor
         struct libusb_device_descriptor desc;
-        int result = libusb_get_device_descriptor(device, &desc);
-        if (result != LIBUSB_SUCCESS) {
-            syslog(LOG_WARNING, "NoteUSB: failed to get device descriptor: %s",
-                   libusb_error_name(result));
-            continue;
-        }
+        if (libusb_get_device_descriptor(dev, &desc) != LIBUSB_SUCCESS) continue;
 
-        // Create device ID from bus:address
-        uint8_t bus = libusb_get_bus_number(device);
-        uint8_t address = libusb_get_device_address(device);
-        std::string device_id = std::to_string(bus) + ":" + std::to_string(address);
+        uint8_t bus  = libusb_get_bus_number(dev);
+        uint8_t addr = libusb_get_device_address(dev);
+        std::string device_id = std::to_string(bus) + ":" + std::to_string(addr);
 
-        // Just collect device info - don't try to open it!
-        // Opening devices will happen in claim_device() when actually needed
-        auto device_desc = std::make_shared<USBDeviceDescriptor>();
-        device_desc->device_id = device_id;
-        device_desc->vendor_id = desc.idVendor;
-        device_desc->product_id = desc.idProduct;
-        device_desc->interface_number = 0;  // Usually 0 for HID
-        device_desc->kernel_driver_attached = false;
-        device_desc->handle = nullptr;  // Will be opened when claimed
+        if (available_devices_.count(device_id)) continue; // already known
 
-        available_devices_[device_id] = device_desc;
-        syslog(LOG_INFO, "NoteUSB: discovered HID device: %s (VID:PID %04x:%04x)",
+        auto d = std::make_shared<USBDeviceDescriptor>();
+        d->device_id         = device_id;
+        d->vendor_id         = desc.idVendor;
+        d->product_id        = desc.idProduct;
+        d->interface_number  = 0;
+        d->handle            = nullptr;
+
+        available_devices_[device_id] = d;
+        syslog(LOG_INFO, "[DeviceHandler] discovered HID %s (VID:PID %04x:%04x)",
                device_id.c_str(), desc.idVendor, desc.idProduct);
     }
 
-    libusb_free_device_list(device_list, 1);
-    syslog(LOG_INFO, "NoteUSB: device discovery complete. Found %zu HID devices",
+    libusb_free_device_list(list, 1);
+    syslog(LOG_INFO, "[DeviceHandler] discovery complete – %zu HID device(s)",
            available_devices_.size());
 }
 
-NoteDaemon::Error DeviceHandler::claim_device(const NoteBytes::Object& msg) {
-    // Extract device_id from message
-    auto* device_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
-    if (!device_id_val) {
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::INVALID_MESSAGE,
-                                            "Missing DEVICE_ID field");
+// ── Device list ───────────────────────────────────────────────────────────────
+
+void DeviceHandler::send_device_list(int reply_fd) {
+    // Re-scan before responding
+    discover_devices();
+
+    NoteBytes::Object response;
+    response.add(NoteMessaging::Keys::EVENT,
+                 NoteMessaging::ProtocolMessages::ITEM_LIST);
+
+    NoteBytes::Array arr;
+    for (const auto& [id, dev] : available_devices_) {
+        auto obj    = dev->to_notebytes();
+        auto bytes  = obj.serialize();
+        arr.add(NoteBytes::Value(bytes, NoteBytes::Type::OBJECT));
     }
-    std::string device_id = device_id_val->as_string();
+    response.add(NoteMessaging::Keys::ITEMS, arr.as_value());
 
-    syslog(LOG_INFO, "NoteUSB: claim device request for %s", device_id.c_str());
-
-    // Check if device exists in available devices
-    auto device_it = available_devices_.find(device_id);
-    if (device_it == available_devices_.end()) {
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::DEVICE_NOT_FOUND,
-                                            "Device not found: " + device_id);
+    if (reply_fd >= 0) {
+        write_to_fd(reply_fd, response);
+    } else {
+        // No specific fd – broadcast to all connected sessions
+        SessionManager::instance().broadcast_to_all(response);
     }
 
-    // Check if already claimed
-    if (claimed_devices_.find(device_id) != claimed_devices_.end()) {
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::ITEM_NOT_AVAILABLE,
-                                            "Device already claimed: " + device_id);
+    syslog(LOG_INFO, "[DeviceHandler] sent device list (%zu devices)",
+           available_devices_.size());
+}
+
+// ── Claim ─────────────────────────────────────────────────────────────────────
+
+NoteDaemon::Error DeviceHandler::claim_device(const NoteBytes::Object& msg,
+                                               int reply_fd,
+                                               pid_t client_pid) {
+    auto* dev_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
+    if (!dev_id_val) {
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::INVALID_MESSAGE, "Missing DEVICE_ID");
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_CLAIMED,
+                            "", err.code, std::string(err.message()));
+        return err;
     }
 
-    // Find the actual libusb_device
-    libusb_device** device_list = nullptr;
-    ssize_t count = libusb_get_device_list(ctx_, &device_list);
-    libusb_device* usb_device = nullptr;
+    std::string device_id = dev_id_val->as_string();
+    syslog(LOG_INFO, "[DeviceHandler] claim request: device=%s pid=%d",
+           device_id.c_str(), client_pid);
+
+    // Validate device exists
+    auto dev_it = available_devices_.find(device_id);
+    if (dev_it == available_devices_.end()) {
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::DEVICE_NOT_FOUND,
+            "Device not found: " + device_id);
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_CLAIMED,
+                            device_id, err.code, std::string(err.message()));
+        return err;
+    }
+
+    // Already claimed?
+    if (claimed_devices_.count(device_id)) {
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::ITEM_NOT_AVAILABLE,
+            "Device already claimed: " + device_id);
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_CLAIMED,
+                            device_id, err.code, std::string(err.message()));
+        return err;
+    }
+
+    // ── Open the libusb device ────────────────────────────────────────────────
+
+    // Find libusb_device for this id
+    libusb_device** list = nullptr;
+    ssize_t count = libusb_get_device_list(ctx_, &list);
+    libusb_device* usb_dev = nullptr;
 
     for (ssize_t i = 0; i < count; ++i) {
-        uint8_t bus = libusb_get_bus_number(device_list[i]);
-        uint8_t address = libusb_get_device_address(device_list[i]);
-        std::string current_id = std::to_string(bus) + ":" + std::to_string(address);
-        if (current_id == device_id) {
-            usb_device = device_list[i];
+        uint8_t bus  = libusb_get_bus_number(list[i]);
+        uint8_t addr = libusb_get_device_address(list[i]);
+        if (std::to_string(bus) + ":" + std::to_string(addr) == device_id) {
+            usb_dev = list[i];
             break;
         }
     }
 
-    if (!usb_device) {
-        libusb_free_device_list(device_list, 1);
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::DEVICE_NOT_FOUND,
-                                            "USB device not found: " + device_id);
+    if (!usb_dev) {
+        libusb_free_device_list(list, 1);
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::DEVICE_NOT_FOUND,
+            "USB device disappeared: " + device_id);
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_CLAIMED,
+                            device_id, err.code, std::string(err.message()));
+        return err;
     }
 
-    // Open device handle
     libusb_device_handle* handle = nullptr;
-    int result = libusb_open(usb_device, &handle);
-    libusb_free_device_list(device_list, 1);
+    int rc = libusb_open(usb_dev, &handle);
+    libusb_free_device_list(list, 1);
 
-    if (result != LIBUSB_SUCCESS) {
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::PERMISSION_DENIED,
-                                            "Cannot open device " + device_id + ": " +
-                                            libusb_error_name(result));
+    if (rc != LIBUSB_SUCCESS) {
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::PERMISSION_DENIED,
+            std::string("Cannot open ") + device_id + ": " + libusb_error_name(rc));
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_CLAIMED,
+                            device_id, err.code, std::string(err.message()));
+        return err;
     }
 
-    auto device_desc = device_it->second;
-    int interface_number = device_desc->interface_number;
+    auto dev_desc = dev_it->second;
+    int iface     = dev_desc->interface_number;
 
-    // Claim interface
-    result = libusb_claim_interface(handle, interface_number);
-    if (result != LIBUSB_SUCCESS) {
+    rc = libusb_claim_interface(handle, iface);
+    if (rc != LIBUSB_SUCCESS) {
         libusb_close(handle);
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::PERMISSION_DENIED,
-                                            "Cannot claim interface for device " + device_id + ": " +
-                                            libusb_error_name(result));
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::PERMISSION_DENIED,
+            std::string("Cannot claim interface for ") + device_id + ": " +
+            libusb_error_name(rc));
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_CLAIMED,
+                            device_id, err.code, std::string(err.message()));
+        return err;
     }
 
     // Detach kernel driver if active
-    bool kernel_driver_attached = false;
-    if (libusb_kernel_driver_active(handle, interface_number) == 1) {
-        result = libusb_detach_kernel_driver(handle, interface_number);
-        if (result == LIBUSB_SUCCESS) {
-            kernel_driver_attached = true;
-            syslog(LOG_INFO, "NoteUSB: detached kernel driver for device %s", device_id.c_str());
-        } else {
-            syslog(LOG_WARNING, "NoteUSB: failed to detach kernel driver for device %s: %s",
-                   device_id.c_str(), libusb_error_name(result));
+    bool kdriver = false;
+    if (libusb_kernel_driver_active(handle, iface) == 1) {
+        if (libusb_detach_kernel_driver(handle, iface) == LIBUSB_SUCCESS) {
+            kdriver = true;
+            syslog(LOG_INFO, "[DeviceHandler] detached kernel driver for %s",
+                   device_id.c_str());
         }
     }
 
-    // Store device info
+    // Store state
     DeviceInfo info;
-    info.device_id = device_id;
-    info.handle = handle;
-    info.interface_number = interface_number;
-    info.kernel_driver_attached = kernel_driver_attached;
-    info.capabilities = Capabilities::Masks::mode_mask();  // Default capabilities
+    info.device_id              = device_id;
+    info.handle                 = handle;
+    info.interface_number       = iface;
+    info.kernel_driver_attached = kdriver;
+    info.capabilities           = Capabilities::Masks::mode_mask();
+    info.owner_pid              = client_pid;
 
     claimed_devices_[device_id] = info;
+    dev_desc->handle             = handle;
+    dev_desc->kernel_driver_attached = kdriver;
+    dev_desc->owner_pid          = client_pid;
 
-    // Update device descriptor
-    device_desc->handle = handle;
-    device_desc->kernel_driver_attached = kernel_driver_attached;
+    // Persist to crash-recovery registry
+    DeviceRegistry::add_device(device_id, iface, kdriver);
 
-    // Register with module-private DeviceRegistry
-    DeviceRegistry::add_device(device_id, interface_number, kernel_driver_attached);
+    // Register ownership so the core can route the DEVICE_HANDSHAKE
+    if (ownership_registry_) {
+        ownership_registry_->register_device(device_id, module_name_);
+    }
 
-    syslog(LOG_INFO, "NoteUSB: successfully claimed device: %s", device_id.c_str());
+    // Send ITEM_CLAIMED on management socket
+    NoteBytes::Object claimed;
+    claimed.add(NoteMessaging::Keys::EVENT,
+                NoteMessaging::ProtocolMessages::ITEM_CLAIMED);
+    claimed.add(NoteMessaging::Keys::DEVICE_ID,  device_id);
+    claimed.add(NoteMessaging::Keys::STATUS,     std::string("claimed"));
+    claimed.add(NoteMessaging::Keys::MODULE_ID,  module_name_);
+    write_to_fd(reply_fd, claimed);
+
+    syslog(LOG_INFO, "[DeviceHandler] claimed device=%s for pid=%d",
+           device_id.c_str(), client_pid);
 
     return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
 }
 
-NoteDaemon::Error DeviceHandler::release_device(const NoteBytes::Object& msg) {
-    // Extract device_id from message
-    auto* device_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
-    if (!device_id_val) {
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::INVALID_MESSAGE,
-                                            "Missing DEVICE_ID field");
-    }
-    std::string device_id = device_id_val->as_string();
+// ── Release ───────────────────────────────────────────────────────────────────
 
-    syslog(LOG_INFO, "NoteUSB: release device request for %s", device_id.c_str());
-
-    // Check if device is claimed
-    auto state_it = claimed_devices_.find(device_id);
-    if (state_it == claimed_devices_.end()) {
-        return NoteDaemon::Error::from_code(NoteMessaging::ErrorCodes::DEVICE_NOT_FOUND,
-                                            "Device not claimed: " + device_id);
+NoteDaemon::Error DeviceHandler::release_device(const NoteBytes::Object& msg,
+                                                  int reply_fd) {
+    auto* dev_id_val = msg.get(NoteMessaging::Keys::DEVICE_ID);
+    if (!dev_id_val) {
+        return NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::INVALID_MESSAGE, "Missing DEVICE_ID");
     }
 
-    auto& info = state_it->second;
+    std::string device_id = dev_id_val->as_string();
+    syslog(LOG_INFO, "[DeviceHandler] release request: device=%s", device_id.c_str());
 
-    // Release interface
+    auto it = claimed_devices_.find(device_id);
+    if (it == claimed_devices_.end()) {
+        auto err = NoteDaemon::Error::from_code(
+            NoteMessaging::ErrorCodes::DEVICE_NOT_FOUND,
+            "Not claimed: " + device_id);
+        send_error_response(reply_fd,
+                            NoteMessaging::ProtocolMessages::ITEM_RELEASED,
+                            device_id, err.code, std::string(err.message()));
+        return err;
+    }
+
+    auto& info = it->second;
     if (info.handle) {
         libusb_release_interface(info.handle, info.interface_number);
-
-        // Reattach kernel driver if it was detached
         if (info.kernel_driver_attached) {
-            int result = libusb_attach_kernel_driver(info.handle, info.interface_number);
-            if (result == LIBUSB_SUCCESS) {
-                syslog(LOG_INFO, "NoteUSB: reattached kernel driver for device %s", device_id.c_str());
-            } else {
-                syslog(LOG_WARNING, "NoteUSB: failed to reattach kernel driver for device %s: %s",
-                       device_id.c_str(), libusb_error_name(result));
+            if (libusb_attach_kernel_driver(info.handle, info.interface_number)
+                    == LIBUSB_SUCCESS) {
+                syslog(LOG_INFO, "[DeviceHandler] reattached kernel driver for %s",
+                       device_id.c_str());
             }
         }
-
-        // Close handle
         libusb_close(info.handle);
     }
 
-    // Remove from claimed devices
-    claimed_devices_.erase(state_it);
+    claimed_devices_.erase(it);
 
-    // Update device descriptor in available devices
-    auto device_it = available_devices_.find(device_id);
-    if (device_it != available_devices_.end()) {
-        device_it->second->handle = nullptr;
-        device_it->second->kernel_driver_attached = false;
+    if (auto dev_it = available_devices_.find(device_id);
+        dev_it != available_devices_.end()) {
+        dev_it->second->handle                 = nullptr;
+        dev_it->second->kernel_driver_attached = false;
+        dev_it->second->owner_pid              = 0;
     }
 
-    // Unregister from module-private DeviceRegistry
     DeviceRegistry::remove_device(device_id);
 
-    syslog(LOG_INFO, "NoteUSB: successfully released device: %s", device_id.c_str());
+    // Unregister ownership – the device socket will be closed by the client
+    if (ownership_registry_) {
+        ownership_registry_->unregister_device(device_id);
+    }
 
+    // Send ITEM_RELEASED on management socket
+    NoteBytes::Object released;
+    released.add(NoteMessaging::Keys::EVENT,
+                 NoteMessaging::ProtocolMessages::ITEM_RELEASED);
+    released.add(NoteMessaging::Keys::DEVICE_ID, device_id);
+    released.add(NoteMessaging::Keys::STATUS,
+                 NoteMessaging::ProtocolMessages::SUCCESS);
+    write_to_fd(reply_fd, released);
+
+    syslog(LOG_INFO, "[DeviceHandler] released device=%s", device_id.c_str());
     return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
 }
 
-void DeviceHandler::send_device_list() {
-    // This would need to be implemented with actual response mechanism
-    // For now, just log the device list
-    syslog(LOG_INFO, "NoteUSB: sending device list with %zu devices", available_devices_.size());
-
-    for (const auto& [id, device] : available_devices_) {
-        syslog(LOG_DEBUG, "NoteUSB:   - %s (VID:PID %04x:%04x)",
-               id.c_str(), device->vendor_id, device->product_id);
-    }
-}
+// ── Bulk release (shutdown) ───────────────────────────────────────────────────
 
 void DeviceHandler::release_all_devices() {
-    for (auto& [device_id, info] : claimed_devices_) {
-        if (info.handle) {
-            // Release interface
-            libusb_release_interface(info.handle, info.interface_number);
+    for (auto& [id, info] : claimed_devices_) {
+        if (!info.handle) continue;
+        libusb_release_interface(info.handle, info.interface_number);
+        if (info.kernel_driver_attached) {
+            libusb_attach_kernel_driver(info.handle, info.interface_number);
+        }
+        libusb_close(info.handle);
 
-            // Reattach kernel driver if detached
-            if (info.kernel_driver_attached) {
-                libusb_attach_kernel_driver(info.handle, info.interface_number);
-            }
-
-            // Close handle
-            libusb_close(info.handle);
+        if (ownership_registry_) {
+            ownership_registry_->unregister_device(id);
         }
     }
     claimed_devices_.clear();
-
-    // Clear available devices
     available_devices_.clear();
-
-    // Remove all from registry
     DeviceRegistry::remove_all();
-
-    syslog(LOG_INFO, "NoteUSB: released all devices");
+    syslog(LOG_INFO, "[DeviceHandler] released all devices");
 }
 
-void DeviceHandler::collect_errors(std::vector<NoteDaemon::Error>& errors) {
-    // No errors to collect for now
+void DeviceHandler::collect_errors(std::vector<NoteDaemon::Error>& /*errors*/) {
+    // Reserved for future per-device error queues
 }
 
-// =============================================================================
-// Helper methods
-// =============================================================================
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 bool DeviceHandler::is_hid_device(libusb_device* device) {
-    libusb_config_descriptor* config = nullptr;
-
-    if (libusb_get_active_config_descriptor(device, &config) != LIBUSB_SUCCESS) {
+    libusb_config_descriptor* cfg = nullptr;
+    if (libusb_get_active_config_descriptor(device, &cfg) != LIBUSB_SUCCESS)
         return false;
-    }
 
-    bool is_hid = false;
-    for (int j = 0; j < config->bNumInterfaces; ++j) {
-        const struct libusb_interface* interface = &config->interface[j];
-        if (interface->num_altsetting > 0) {
-            const struct libusb_interface_descriptor* altsetting = &interface->altsetting[0];
-            if (altsetting->bInterfaceClass == LIBUSB_CLASS_HID) {
-                is_hid = true;
-                break;
-            }
+    bool found = false;
+    for (int i = 0; i < cfg->bNumInterfaces && !found; ++i) {
+        const auto& iface = cfg->interface[i];
+        if (iface.num_altsetting > 0 &&
+            iface.altsetting[0].bInterfaceClass == LIBUSB_CLASS_HID) {
+            found = true;
         }
     }
-
-    libusb_free_config_descriptor(config);
-    return is_hid;
+    libusb_free_config_descriptor(cfg);
+    return found;
 }
 
-std::shared_ptr<USBDeviceDescriptor> DeviceHandler::find_device_by_id(const std::string& device_id) {
-    auto it = available_devices_.find(device_id);
-    if (it != available_devices_.end()) {
-        return it->second;
+std::shared_ptr<USBDeviceDescriptor>
+DeviceHandler::find_device_by_id(const std::string& id) {
+    auto it = available_devices_.find(id);
+    return (it != available_devices_.end()) ? it->second : nullptr;
+}
+
+void DeviceHandler::write_to_fd(int fd, const NoteBytes::Object& obj) {
+    if (fd < 0) return;
+    try {
+        NoteBytes::Writer writer(fd, /*owns_fd=*/false);
+        writer.write(obj);
+        writer.flush();
+    } catch (const std::exception& e) {
+        syslog(LOG_WARNING, "[DeviceHandler] write_to_fd fd=%d: %s", fd, e.what());
     }
-    return nullptr;
 }
 
-NoteDaemon::Error DeviceHandler::send_response(const NoteBytes::Object& response) {
-    // This is a placeholder - in the full implementation, this would send
-    // the response back to the client through the session manager
-    syslog(LOG_DEBUG, "NoteUSB: send_response called");
-    return NoteDaemon::Error(NoteDaemon::ErrorCodes::SUCCESS, "");
+void DeviceHandler::send_error_response(int fd,
+                                         const NoteBytes::Value& event,
+                                         const std::string& device_id,
+                                         int code,
+                                         const std::string& message) {
+    NoteBytes::Object err;
+    err.add(NoteMessaging::Keys::EVENT,     event);
+    err.add(NoteMessaging::Keys::ERROR,     code);
+    err.add(NoteMessaging::Keys::MSG,       message);
+    if (!device_id.empty()) {
+        err.add(NoteMessaging::Keys::DEVICE_ID, device_id);
+    }
+    write_to_fd(fd, err);
 }
 
 } // namespace NoteUSB

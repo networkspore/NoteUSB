@@ -1,6 +1,17 @@
 // include/note_usb/session_manager.h
-// Module-private session management for NoteUSB
-// Handles hotplug broadcasting and session lifecycle
+// Module-private session registry for NoteUSB.
+//
+// Two-socket model:
+//   • management_fd  – the client's management socket connection.  Used to
+//     send ITEM_CLAIMED, ITEM_RELEASED, ITEM_LIST, hotplug events, and errors
+//     back to the Java IODaemon.
+//   • device_fd      – the separate socket the Java client opens after it
+//     receives ITEM_CLAIMED.  Owned exclusively by NoteUSBSession for streaming
+//     raw/parsed HID data.
+//
+// SessionManager stores sessions keyed by client PID and provides:
+//   • Broadcast to all management fds (hotplug: DEVICE_ATTACHED/DETACHED)
+//   • Per-device management-fd lookup (ITEM_CLAIMED / ITEM_RELEASED responses)
 
 #ifndef NOTE_USB_SESSION_MANAGER_H
 #define NOTE_USB_SESSION_MANAGER_H
@@ -10,159 +21,175 @@
 #include <map>
 #include <mutex>
 #include <syslog.h>
+#include <unistd.h>
+#include <cstring>
 #include "notebytes.h"
 
 namespace NoteUSB {
 
-// Forward declaration
 class NoteUSBSession;
 
 /**
- * Session ID - unique identifier for a client connection
+ * Per-session record held by the SessionManager.
  */
-using SessionID = int;  // Client file descriptor
-
-/**
- * Session ID - unique identifier for a client connection
- */
-struct Session {
-    SessionID client_fd;
+struct SessionEntry {
     pid_t client_pid;
-    bool is_active;
+    int   management_fd;  // management socket – write hotplug/response events here
+    bool  is_active;
     NoteUSBSession* session;
 
-    Session(SessionID fd, pid_t pid, NoteUSBSession* sess)
-        : client_fd(fd), client_pid(pid), is_active(true), session(sess) {}
+    SessionEntry(pid_t pid, int mgmt_fd, NoteUSBSession* sess)
+        : client_pid(pid)
+        , management_fd(mgmt_fd)
+        , is_active(true)
+        , session(sess)
+    {}
 };
 
 /**
- * Session Manager - module-private session registry
- * Manages all active sessions for hotplug notifications
- * 
- * This is module-private - no other modules should access it.
+ * SessionManager – module-private singleton.
+ *
+ * Tracks all connected clients.  Provides:
+ *  • register_session() / unregister_session()
+ *  • broadcast_to_all()   – send a message to every active management fd
+ *  • send_to_session()    – send to one management fd by PID
  */
 class SessionManager {
 public:
     static SessionManager& instance() {
-        static SessionManager manager;
-        return manager;
+        static SessionManager inst;
+        return inst;
     }
 
-    // ===== Session Management =====
+    // ── Session lifecycle ──────────────────────────────────────────────────────
 
     /**
-     * Register a session for hotplug notifications
+     * Register a newly-connected client.
+     * @param client_pid    Client process ID (session key).
+     * @param management_fd Management socket fd for this client.
+     * @param session       Pointer to the owning NoteUSBSession (may be nullptr
+     *                      initially; updated via update_session()).
      */
-    void register_session(SessionID client_fd, pid_t client_pid, NoteUSBSession* session) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        SessionID sid = next_session_id_++;
-        sessions_[sid] = std::make_unique<Session>(client_fd, client_pid, session);
-
-        syslog(LOG_INFO, "Session registered for hotplug notifications (total: %zu, sid=%d)",
-               sessions_.size(), sid);
+    void register_session(pid_t client_pid, int management_fd,
+                          NoteUSBSession* session) {
+        std::lock_guard lock(mutex_);
+        sessions_.emplace(client_pid,
+                          std::make_unique<SessionEntry>(client_pid,
+                                                        management_fd,
+                                                        session));
+        syslog(LOG_INFO,
+               "[SessionManager] registered pid=%d fd=%d (total=%zu)",
+               client_pid, management_fd, sessions_.size());
     }
 
     /**
-     * Unregister a session (called on disconnect)
+     * Update the NoteUSBSession pointer for an already-registered pid.
+     * Called once the session object is fully constructed.
      */
-    void unregister_session(SessionID session_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        auto it = sessions_.find(session_id);
+    void update_session(pid_t client_pid, NoteUSBSession* session) {
+        std::lock_guard lock(mutex_);
+        auto it = sessions_.find(client_pid);
         if (it != sessions_.end()) {
-            sessions_.erase(it);
-            syslog(LOG_INFO, "Session unregistered (total: %zu, sid=%d)",
-                   sessions_.size(), session_id);
+            it->second->session = session;
         }
     }
 
     /**
-     * Unregister a session by client FD and PID
+     * Unregister a session.  Management fd is NOT closed here; the caller
+     * (NoteUSBModule) is responsible for closing it after all responses are sent.
      */
-    void unregister_session_by_client(SessionID client_fd, pid_t client_pid) {
-        std::lock_guard<std::mutex> lock(mutex_);
+    void unregister_session(pid_t client_pid) {
+        std::lock_guard lock(mutex_);
+        auto erased = sessions_.erase(client_pid);
+        if (erased) {
+            syslog(LOG_INFO,
+                   "[SessionManager] unregistered pid=%d (total=%zu)",
+                   client_pid, sessions_.size());
+        }
+    }
 
-        for (auto& [sid, session] : sessions_) {
-            if (session->client_fd == client_fd && session->client_pid == client_pid) {
-                sessions_.erase(sid);
-                syslog(LOG_INFO, "Session unregistered by client (total: %zu, sid=%d)",
-                       sessions_.size(), sid);
-                break;
+    // ── Sending ───────────────────────────────────────────────────────────────
+
+    /**
+     * Broadcast a message to all active sessions' management fds.
+     * Used for hotplug notifications (DEVICE_ATTACHED / DEVICE_DETACHED).
+     * Failed writes mark the session inactive; stale entries are pruned lazily.
+     */
+    void broadcast_to_all(const NoteBytes::Object& msg) {
+        std::lock_guard lock(mutex_);
+        std::vector<uint8_t> data = msg.serialize_with_header();
+
+        for (auto& [pid, entry] : sessions_) {
+            if (!entry->is_active) continue;
+            if (!write_bytes(entry->management_fd, data)) {
+                syslog(LOG_WARNING,
+                       "[SessionManager] broadcast failed to pid=%d, marking inactive",
+                       pid);
+                entry->is_active = false;
             }
         }
     }
 
     /**
-     * Send a message to all active sessions
-     * Used for hotplug notifications (device attach/detach)
+     * Send a message to a specific session's management fd.
+     * Returns false if the session is not found or the write fails.
      */
-    void broadcast_to_all_sessions(const NoteBytes::Object& msg) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        int sent_count = 0;
-        for (const auto& [sid, session] : sessions_) {
-            if (session && session->is_active && session->client_fd >= 0) {
-                try {
-                    send_message(session->client_fd, msg);
-                    sent_count++;
-                } catch (const std::exception& e) {
-                    syslog(LOG_WARNING, "Failed to broadcast to session fd=%d: %s",
-                           session->client_fd, e.what());
-                    // Mark session as inactive (will be cleaned up)
-                    session->is_active = false;
-                }
-            }
+    bool send_to_session(pid_t client_pid, const NoteBytes::Object& msg) {
+        std::lock_guard lock(mutex_);
+        auto it = sessions_.find(client_pid);
+        if (it == sessions_.end() || !it->second->is_active) {
+            return false;
         }
 
-        syslog(LOG_DEBUG, "Broadcasted message to %zu sessions", sent_count);
+        std::vector<uint8_t> data = msg.serialize_with_header();
+        bool ok = write_bytes(it->second->management_fd, data);
+        if (!ok) {
+            syslog(LOG_WARNING,
+                   "[SessionManager] send failed to pid=%d, marking inactive", client_pid);
+            it->second->is_active = false;
+        }
+        return ok;
     }
 
-    /**
-     * Get total number of active sessions
-     */
-    size_t session_count() {
-        std::lock_guard<std::mutex> lock(mutex_);
+    // ── Query ─────────────────────────────────────────────────────────────────
+
+    size_t session_count() const {
+        std::lock_guard lock(mutex_);
         return sessions_.size();
     }
 
-    /**
-     * Check if a session is active
-     */
-    bool is_session_active(SessionID client_fd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [sid, session] : sessions_) {
-            if (session && session->is_active && session->client_fd == client_fd) {
-                return true;
-            }
-        }
-        return false;
+    bool is_active(pid_t client_pid) const {
+        std::lock_guard lock(mutex_);
+        auto it = sessions_.find(client_pid);
+        return it != sessions_.end() && it->second->is_active;
+    }
+
+    /** Return the management fd for a PID, or -1 if not found. */
+    int get_management_fd(pid_t client_pid) const {
+        std::lock_guard lock(mutex_);
+        auto it = sessions_.find(client_pid);
+        return (it != sessions_.end()) ? it->second->management_fd : -1;
     }
 
 private:
-    SessionManager() = default;
+    SessionManager()  = default;
     ~SessionManager() = default;
-    SessionManager(const SessionManager&) = delete;
+    SessionManager(const SessionManager&)            = delete;
     SessionManager& operator=(const SessionManager&) = delete;
 
-    /**
-     * Send a message to a specific session
-     */
-    void send_message(SessionID client_fd, const NoteBytes::Object& msg) {
-        // Serialize message to bytes
-        std::vector<uint8_t> data = msg.serialize_with_header();
-        
-        // Write to socket
-        ssize_t sent = write(client_fd, data.data(), data.size());
-        if (sent == -1) {
-            syslog(LOG_ERR, "SessionManager: failed to send message to fd=%d: %s",
-                   client_fd, strerror(errno));
+    /** Write a fully-framed byte buffer to a fd. Returns false on error. */
+    static bool write_bytes(int fd, const std::vector<uint8_t>& data) {
+        ssize_t sent = ::write(fd, data.data(), data.size());
+        if (sent < 0) {
+            syslog(LOG_ERR, "[SessionManager] write fd=%d: %s",
+                   fd, strerror(errno));
+            return false;
         }
+        return true;
     }
 
-    std::mutex mutex_;
-    std::map<SessionID, std::unique_ptr<Session>> sessions_;
-    SessionID next_session_id_ = 1;  // Start at 1 to distinguish from invalid FD=0
+    mutable std::mutex mutex_;
+    std::map<pid_t, std::unique_ptr<SessionEntry>> sessions_;
 };
 
 } // namespace NoteUSB
