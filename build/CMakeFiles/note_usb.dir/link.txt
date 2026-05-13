@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,note_usb.so -o note_usb.so CMakeFiles/note_usb.dir/src/module.cpp.o CMakeFiles/note_usb.dir/src/device_handler.cpp.o CMakeFiles/note_usb.dir/src/note_usb_session.cpp.o CMakeFiles/note_usb.dir/src/hid_streaming_thread.cpp.o  -lusb-1.0 /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so -lpthread -ldl 
